@@ -14,6 +14,7 @@ function DailyReport() {
   const [dailyData, setDailyData] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [retryCountdown, setRetryCountdown] = useState(0)
   const [viewMode, setViewMode] = useState(selectedDate ? 'detail' : 'overview')
   const [stats, setStats] = useState({
     totalUsage: 0,
@@ -32,43 +33,85 @@ function DailyReport() {
         throw new Error('No site ID found. Please login again.')
       }
 
-      // Fetch last 30 days of usage data
-      const dailyStats = []
+      // API allows max 7 days per request, so we need to chunk the 30-day range
+      const now = new Date()
+      const chunks = []
 
-      for (let i = 0; i < 30; i++) {
-        const date = format(subDays(new Date(), i), 'yyyy-MM-dd')
-
-        try {
-          const [usage, prices] = await Promise.all([
-            amberApi.getUsage(siteId, date, date),
-            amberApi.getPrices(siteId, date, date, 30)
-          ])
-
-          const generalUsage = usage.filter(u => u.channelType === 'general')
-          const solarExports = usage.filter(u => u.channelType === 'feedIn')
-          const generalPrices = prices.filter(p => p.channelType === 'general')
-
-          const totalUsage = generalUsage.reduce((sum, u) => sum + u.kwh, 0)
-          const solarGeneration = Math.abs(solarExports.reduce((sum, u) => sum + u.kwh, 0))
-          const totalCost = generalUsage.reduce((sum, u) => sum + u.cost, 0)
-          const avgRenewables = generalPrices.reduce((sum, p) => sum + p.renewables, 0) / (generalPrices.length || 1)
-
-          dailyStats.push({
-            date: date,
-            displayDate: format(new Date(date), 'MMM dd'),
-            usage: totalUsage,
-            solarExports: solarGeneration,
-            cost: totalCost,
-            renewables: avgRenewables
-          })
-        } catch (err) {
-          // Skip days with no data
-          console.warn(`No data for ${date}`)
-        }
+      // Create 7-day chunks to cover 30 days
+      for (let i = 0; i < 30; i += 7) {
+        const chunkEnd = subDays(now, i)
+        const chunkStart = subDays(now, Math.min(i + 6, 29))
+        chunks.push({
+          startDate: format(chunkStart, 'yyyy-MM-dd'),
+          endDate: format(chunkEnd, 'yyyy-MM-dd')
+        })
       }
 
-      // Reverse to show oldest first
-      setDailyData(dailyStats.reverse())
+      // Fetch all chunks in parallel
+      const chunkPromises = chunks.map(chunk =>
+        Promise.all([
+          amberApi.getUsage(siteId, chunk.startDate, chunk.endDate),
+          amberApi.getPrices(siteId, chunk.startDate, chunk.endDate, 30)
+        ])
+      )
+
+      const chunkResults = await Promise.all(chunkPromises)
+
+      // Flatten all chunks into single arrays
+      const usage = chunkResults.flatMap(([u, _]) => u)
+      const prices = chunkResults.flatMap(([_, p]) => p)
+
+      // Group usage and prices by date
+      const usageByDate = {}
+      const pricesByDate = {}
+
+      usage.forEach(item => {
+        const date = format(new Date(item.startTime), 'yyyy-MM-dd')
+        if (!usageByDate[date]) {
+          usageByDate[date] = { general: [], feedIn: [] }
+        }
+        if (item.channelType === 'general') {
+          usageByDate[date].general.push(item)
+        } else if (item.channelType === 'feedIn') {
+          usageByDate[date].feedIn.push(item)
+        }
+      })
+
+      prices.forEach(item => {
+        const date = format(new Date(item.startTime), 'yyyy-MM-dd')
+        if (!pricesByDate[date]) {
+          pricesByDate[date] = []
+        }
+        if (item.channelType === 'general') {
+          pricesByDate[date].push(item)
+        }
+      })
+
+      // Calculate daily stats
+      const dailyStats = []
+      for (let i = 29; i >= 0; i--) {
+        const date = format(subDays(now, i), 'yyyy-MM-dd')
+        const dayUsage = usageByDate[date] || { general: [], feedIn: [] }
+        const dayPrices = pricesByDate[date] || []
+
+        const totalUsage = dayUsage.general.reduce((sum, u) => sum + (u.kwh || 0), 0)
+        const solarGeneration = Math.abs(dayUsage.feedIn.reduce((sum, u) => sum + (u.kwh || 0), 0))
+        const totalCost = dayUsage.general.reduce((sum, u) => sum + (u.cost || 0), 0)
+        const avgRenewables = dayPrices.length > 0
+          ? dayPrices.reduce((sum, p) => sum + (p.renewables || 0), 0) / dayPrices.length
+          : 0
+
+        dailyStats.push({
+          date: date,
+          displayDate: format(new Date(date), 'MMM dd'),
+          usage: totalUsage,
+          solarExports: solarGeneration,
+          cost: totalCost,
+          renewables: avgRenewables
+        })
+      }
+
+      setDailyData(dailyStats)
 
       // Calculate overall stats
       if (dailyStats.length > 0) {
@@ -78,13 +121,18 @@ function DailyReport() {
 
         setStats({
           totalUsage: totalUsage.toFixed(2),
-          totalCost: totalCost.toFixed(2),
-          avgPrice: dailyStats.length > 0 ? (totalCost / totalUsage * 100).toFixed(2) : 0,
+          totalCost: (totalCost / 100).toFixed(2), // Convert cents to dollars
+          avgPrice: totalUsage > 0 ? (totalCost / totalUsage).toFixed(2) : 0,
           renewables: avgRenewables.toFixed(1)
         })
       }
     } catch (err) {
       setError(err.message || 'Failed to fetch overview data')
+
+      // Handle rate limiting with automatic retry
+      if (err.isRateLimit && err.retryAfter) {
+        setRetryCountdown(err.retryAfter)
+      }
     } finally {
       setLoading(false)
     }
@@ -138,6 +186,11 @@ function DailyReport() {
       })
     } catch (err) {
       setError(err.message || 'Failed to fetch detail data')
+
+      // Handle rate limiting with automatic retry
+      if (err.isRateLimit && err.retryAfter) {
+        setRetryCountdown(err.retryAfter)
+      }
     } finally {
       setLoading(false)
     }
@@ -152,6 +205,28 @@ function DailyReport() {
       fetchOverviewData()
     }
   }, [selectedDate])
+
+  // Handle retry countdown
+  useEffect(() => {
+    if (retryCountdown <= 0) return
+
+    const timer = setInterval(() => {
+      setRetryCountdown(prev => {
+        if (prev <= 1) {
+          // Countdown finished, retry the request
+          if (selectedDate) {
+            fetchDetailData(selectedDate)
+          } else {
+            fetchOverviewData()
+          }
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+
+    return () => clearInterval(timer)
+  }, [retryCountdown, selectedDate])
 
   const handleBarClick = (data) => {
     if (data && data.date) {
@@ -175,29 +250,20 @@ function DailyReport() {
           {viewMode === 'overview' ? (
             <>
               <p style={{ margin: '0 0 5px 0' }}>{`Date: ${payload[0].payload.displayDate}`}</p>
-              <p style={{ margin: '0 0 5px 0', color: '#2196f3' }}>
+              <p style={{ margin: '0', color: '#2196f3' }}>
                 {`Usage: ${payload[0].value.toFixed(2)} kWh`}
               </p>
               {payload[0].payload.solarExports > 0 && (
-                <p style={{ margin: '0 0 5px 0', color: '#ffa726' }}>
+                <p style={{ margin: '0', color: '#ffa726' }}>
                   {`Solar: ${payload[0].payload.solarExports.toFixed(2)} kWh`}
                 </p>
               )}
-              <p style={{ margin: '0', color: '#4caf50' }}>
-                {`Cost: $${payload[0].payload.cost.toFixed(2)}`}
-              </p>
             </>
           ) : (
             <>
               <p style={{ margin: '0 0 5px 0' }}>{`Time: ${payload[0].payload.time}`}</p>
-              <p style={{ margin: '0 0 5px 0', color: '#2196f3' }}>
+              <p style={{ margin: '0', color: '#2196f3' }}>
                 {`Usage: ${payload[0].value.toFixed(2)} kWh`}
-              </p>
-              <p style={{ margin: '0 0 5px 0', color: '#ff6b35' }}>
-                {`Price: ${payload[0].payload.price.toFixed(2)} c/kWh`}
-              </p>
-              <p style={{ margin: '0', color: '#4caf50' }}>
-                {`Cost: $${payload[0].payload.cost.toFixed(2)}`}
               </p>
             </>
           )}
@@ -221,7 +287,16 @@ function DailyReport() {
       </div>
 
       {loading && <div className="loading">Loading...</div>}
-      {error && <div className="error">{error}</div>}
+      {error && (
+        <div className="error">
+          {error}
+          {retryCountdown > 0 && (
+            <div style={{ marginTop: '0.5rem', fontSize: '0.9rem' }}>
+              Retrying automatically in {retryCountdown} second{retryCountdown !== 1 ? 's' : ''}...
+            </div>
+          )}
+        </div>
+      )}
 
       {!loading && !error && (
         <>
@@ -305,15 +380,6 @@ function DailyReport() {
                     strokeWidth={2}
                     dot={{ fill: '#2196f3' }}
                     name="Usage (kWh)"
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="price"
-                    stroke="#ff6b35"
-                    strokeWidth={2}
-                    dot={{ fill: '#ff6b35' }}
-                    name="Price (c/kWh)"
-                    yAxisId="price"
                   />
                 </LineChart>
               )}

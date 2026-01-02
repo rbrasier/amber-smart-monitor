@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
-import { format, subHours, subDays } from 'date-fns'
+import { format, subHours, startOfDay } from 'date-fns'
 import { amberApi } from '../services/amberApi'
 import { storage } from '../utils/storage'
 
@@ -8,7 +8,7 @@ const TIME_RANGES = {
   '6h': { label: 'Last 6 Hours', hours: 6 },
   '12h': { label: 'Last 12 Hours', hours: 12 },
   '24h': { label: 'Last 24 Hours', hours: 24 },
-  'today': { label: 'Current Day', hours: null }
+  'today': { label: 'Today', hours: null }
 }
 
 function LiveUsage() {
@@ -16,11 +16,12 @@ function LiveUsage() {
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [retryCountdown, setRetryCountdown] = useState(0)
   const [stats, setStats] = useState({
-    currentPrice: 0,
-    avgPrice: 0,
-    renewables: 0,
-    totalCost: 0
+    currentUsage: 0,
+    avgUsage: 0,
+    totalUsage: 0,
+    estimatedCost: 0
   })
 
   const fetchData = async () => {
@@ -33,54 +34,58 @@ function LiveUsage() {
         throw new Error('No site ID found. Please login again.')
       }
 
-      let intervals = []
       const now = new Date()
+      let startDate, endDate
 
       if (timeRange === 'today') {
         // Fetch current day data
-        const startDate = format(now, 'yyyy-MM-dd')
-        const endDate = format(now, 'yyyy-MM-dd')
-        intervals = await amberApi.getPrices(siteId, startDate, endDate, 30)
+        startDate = format(startOfDay(now), 'yyyy-MM-dd')
+        endDate = format(now, 'yyyy-MM-dd')
       } else {
-        // Fetch live data with previous intervals
+        // Fetch data for the specified time range
         const range = TIME_RANGES[timeRange]
-        const numIntervals = Math.ceil((range.hours * 60) / 30) // 30-minute intervals
-        intervals = await amberApi.getCurrentPrices(siteId, {
-          previous: numIntervals,
-          next: 12,
-          resolution: 30
-        })
+        startDate = format(subHours(now, range.hours), 'yyyy-MM-dd')
+        endDate = format(now, 'yyyy-MM-dd')
       }
 
-      // Filter for general usage channel
-      const generalIntervals = intervals.filter(interval => interval.channelType === 'general')
+      const usageData = await amberApi.getUsage(siteId, startDate, endDate)
+
+      // Filter for general usage channel and sort by time
+      const generalUsage = usageData
+        .filter(item => item.channelType === 'general')
+        .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))
 
       // Transform data for chart
-      const chartData = generalIntervals.map(interval => ({
-        time: format(new Date(interval.startTime), 'HH:mm'),
-        price: interval.perKwh,
-        spotPrice: interval.spotPerKwh,
-        renewables: interval.renewables,
-        fullTime: interval.startTime,
-        descriptor: interval.descriptor
+      const chartData = generalUsage.map(item => ({
+        time: format(new Date(item.startTime), 'HH:mm'),
+        usage: item.kwh || 0,
+        cost: item.cost || 0,
+        fullTime: item.startTime
       }))
 
       setData(chartData)
 
       // Calculate stats
-      if (generalIntervals.length > 0) {
-        const current = generalIntervals[generalIntervals.length - 1]
-        const avgPrice = generalIntervals.reduce((sum, i) => sum + i.perKwh, 0) / generalIntervals.length
+      if (generalUsage.length > 0) {
+        const totalUsage = generalUsage.reduce((sum, i) => sum + (i.kwh || 0), 0)
+        const totalCost = generalUsage.reduce((sum, i) => sum + (i.cost || 0), 0)
+        const avgUsage = totalUsage / generalUsage.length
+        const current = generalUsage[generalUsage.length - 1]
 
         setStats({
-          currentPrice: current.perKwh.toFixed(2),
-          avgPrice: avgPrice.toFixed(2),
-          renewables: current.renewables.toFixed(1),
-          descriptor: current.descriptor
+          currentUsage: (current.kwh || 0).toFixed(2),
+          avgUsage: avgUsage.toFixed(2),
+          totalUsage: totalUsage.toFixed(2),
+          estimatedCost: (totalCost / 100).toFixed(2) // Convert cents to dollars
         })
       }
     } catch (err) {
       setError(err.message || 'Failed to fetch data')
+
+      // Handle rate limiting with automatic retry
+      if (err.isRateLimit && err.retryAfter) {
+        setRetryCountdown(err.retryAfter)
+      }
     } finally {
       setLoading(false)
     }
@@ -94,6 +99,24 @@ function LiveUsage() {
     return () => clearInterval(interval)
   }, [timeRange])
 
+  // Handle retry countdown
+  useEffect(() => {
+    if (retryCountdown <= 0) return
+
+    const timer = setInterval(() => {
+      setRetryCountdown(prev => {
+        if (prev <= 1) {
+          // Countdown finished, retry the request
+          fetchData()
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+
+    return () => clearInterval(timer)
+  }, [retryCountdown])
+
   const CustomTooltip = ({ active, payload }) => {
     if (active && payload && payload.length) {
       return (
@@ -104,31 +127,13 @@ function LiveUsage() {
           borderRadius: '4px'
         }}>
           <p style={{ margin: '0 0 5px 0' }}>{`Time: ${payload[0].payload.time}`}</p>
-          <p style={{ margin: '0 0 5px 0', color: '#ff6b35' }}>
-            {`Price: ${payload[0].value.toFixed(2)} c/kWh`}
-          </p>
-          <p style={{ margin: '0 0 5px 0', color: '#4caf50' }}>
-            {`Renewables: ${payload[0].payload.renewables.toFixed(1)}%`}
-          </p>
-          <p style={{ margin: '0', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-            {`Status: ${payload[0].payload.descriptor}`}
+          <p style={{ margin: '0', color: '#2196f3' }}>
+            {`Usage: ${payload[0].value.toFixed(2)} kWh`}
           </p>
         </div>
       )
     }
     return null
-  }
-
-  const getPriceColor = (descriptor) => {
-    switch (descriptor) {
-      case 'spike': return '#f44336'
-      case 'high': return '#ff9800'
-      case 'neutral': return '#2196f3'
-      case 'low': return '#4caf50'
-      case 'veryLow': return '#00e676'
-      case 'extremelyLow': return '#00c853'
-      default: return '#2196f3'
-    }
   }
 
   return (
@@ -149,36 +154,51 @@ function LiveUsage() {
       </div>
 
       {loading && <div className="loading">Loading...</div>}
-      {error && <div className="error">{error}</div>}
+      {error && (
+        <div className="error">
+          {error}
+          {retryCountdown > 0 && (
+            <div style={{ marginTop: '0.5rem', fontSize: '0.9rem' }}>
+              Retrying automatically in {retryCountdown} second{retryCountdown !== 1 ? 's' : ''}...
+            </div>
+          )}
+        </div>
+      )}
 
       {!loading && !error && (
         <>
           <div className="stats-grid">
-            <div className="stat-card" style={{ borderLeftColor: getPriceColor(stats.descriptor) }}>
-              <div className="stat-label">Current Price</div>
+            <div className="stat-card">
+              <div className="stat-label">Current Usage</div>
               <div className="stat-value">
-                {stats.currentPrice}
-                <span className="stat-unit">c/kWh</span>
+                {stats.currentUsage}
+                <span className="stat-unit">kWh</span>
               </div>
             </div>
             <div className="stat-card">
-              <div className="stat-label">Average Price</div>
+              <div className="stat-label">Average Usage</div>
               <div className="stat-value">
-                {stats.avgPrice}
-                <span className="stat-unit">c/kWh</span>
+                {stats.avgUsage}
+                <span className="stat-unit">kWh</span>
               </div>
             </div>
             <div className="stat-card">
-              <div className="stat-label">Renewables</div>
+              <div className="stat-label">Total Usage</div>
               <div className="stat-value">
-                {stats.renewables}
-                <span className="stat-unit">%</span>
+                {stats.totalUsage}
+                <span className="stat-unit">kWh</span>
+              </div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Estimated Cost</div>
+              <div className="stat-value">
+                ${stats.estimatedCost}
               </div>
             </div>
           </div>
 
           <div className="card">
-            <h2 style={{ marginBottom: '1rem' }}>Price History</h2>
+            <h2 style={{ marginBottom: '1rem' }}>Consumption History</h2>
             <ResponsiveContainer width="100%" height={400}>
               <LineChart data={data}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#333" />
@@ -190,26 +210,17 @@ function LiveUsage() {
                 <YAxis
                   stroke="#a0a0a0"
                   tick={{ fill: '#a0a0a0' }}
-                  label={{ value: 'Price (c/kWh)', angle: -90, position: 'insideLeft', fill: '#a0a0a0' }}
+                  label={{ value: 'Usage (kWh)', angle: -90, position: 'insideLeft', fill: '#a0a0a0' }}
                 />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ color: '#a0a0a0' }} />
                 <Line
                   type="monotone"
-                  dataKey="price"
-                  stroke="#ff6b35"
+                  dataKey="usage"
+                  stroke="#2196f3"
                   strokeWidth={2}
-                  dot={{ fill: '#ff6b35' }}
-                  name="Price (c/kWh)"
-                />
-                <Line
-                  type="monotone"
-                  dataKey="renewables"
-                  stroke="#4caf50"
-                  strokeWidth={2}
-                  dot={{ fill: '#4caf50' }}
-                  name="Renewables (%)"
-                  yAxisId="renewables"
+                  dot={{ fill: '#2196f3' }}
+                  name="Usage (kWh)"
                 />
               </LineChart>
             </ResponsiveContainer>

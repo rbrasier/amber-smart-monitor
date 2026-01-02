@@ -8,6 +8,7 @@ function Login({ onLogin }) {
   const [apiKey, setApiKey] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [retryCountdown, setRetryCountdown] = useState(0)
   const navigate = useNavigate()
 
   // Check if there's a saved API key
@@ -17,6 +18,17 @@ function Login({ onLogin }) {
       setApiKey(savedApiKey)
     }
   }, [])
+
+  // Handle retry countdown (just display, no auto-retry on login)
+  useEffect(() => {
+    if (retryCountdown <= 0) return
+
+    const timer = setInterval(() => {
+      setRetryCountdown(prev => Math.max(0, prev - 1))
+    }, 1000)
+
+    return () => clearInterval(timer)
+  }, [retryCountdown])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -47,6 +59,11 @@ function Login({ onLogin }) {
       }
     } catch (err) {
       setError(err.message || 'Login failed. Please check your API key.')
+
+      // Handle rate limiting
+      if (err.isRateLimit && err.retryAfter) {
+        setRetryCountdown(err.retryAfter)
+      }
     } finally {
       setLoading(false)
     }
@@ -76,7 +93,16 @@ function Login({ onLogin }) {
             </p>
           </div>
 
-          {error && <div className="error">{error}</div>}
+          {error && (
+            <div className="error">
+              {error}
+              {retryCountdown > 0 && (
+                <div style={{ marginTop: '0.5rem', fontSize: '0.9rem' }}>
+                  Please wait {retryCountdown} second{retryCountdown !== 1 ? 's' : ''} before trying again.
+                </div>
+              )}
+            </div>
+          )}
 
           <button
             type="submit"
