@@ -50,6 +50,14 @@ function LiveUsage() {
 
       const usageData = await amberApi.getUsage(siteId, startDate, endDate)
 
+      console.log('LiveUsage API Response:', {
+        timeRange,
+        startDate,
+        endDate,
+        totalRecords: usageData.length,
+        sample: usageData.slice(0, 2)
+      })
+
       // Filter for general usage channel and sort by time
       const generalUsage = usageData
         .filter(item => item.channelType === 'general')
@@ -62,6 +70,12 @@ function LiveUsage() {
         cost: item.cost || 0,
         fullTime: item.startTime
       }))
+
+      console.log('Filtered & Transformed:', {
+        generalUsageCount: generalUsage.length,
+        chartDataCount: chartData.length,
+        chartDataSample: chartData.slice(0, 3)
+      })
 
       setData(chartData)
 
